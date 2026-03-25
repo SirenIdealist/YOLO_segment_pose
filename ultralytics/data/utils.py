@@ -264,6 +264,89 @@ def verify_image_label(args: tuple) -> list:
         return [None, None, None, None, None, nm, nf, ne, nc, msg]
 
 
+def verify_image_label_segpose(args: tuple) -> list:
+    """Verify one image-label pair for segment_pose task.
+
+    Label format: class x y w h kpt1_x kpt1_y kpt1_v ... kptN_x kptN_y kptN_v seg1_x seg1_y ... segM_x segM_y
+    """
+    im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim, single_cls = args
+    nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
+    try:
+        # Verify images
+        im = Image.open(im_file)
+        im.verify()
+        shape = exif_size(im)
+        shape = (shape[1], shape[0])  # hw
+        assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+        assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}. {FORMATS_HELP_MSG}"
+        if im.format.lower() in {"jpg", "jpeg"}:
+            with open(im_file, "rb") as f:
+                f.seek(-2, 2)
+                if f.read() != b"\xff\xd9":
+                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
+                    msg = f"{prefix}{im_file}: corrupt JPEG restored and saved"
+
+        # Verify labels - combined format: class bbox(4) keypoints(nkpt*ndim) segments(variable)
+        kpt_len = nkpt * ndim
+        if os.path.isfile(lb_file):
+            nf = 1
+            with open(lb_file, encoding="utf-8") as f:
+                lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                # Extract segments from the portion after class + bbox + keypoints
+                segments = []
+                lb_kpt = []
+                for x in lb:
+                    fixed_len = 1 + 4 + kpt_len  # class + bbox(4) + keypoints
+                    lb_kpt.append(x[:fixed_len])
+                    seg_data = x[fixed_len:]
+                    if seg_data:
+                        segments.append(np.array(seg_data, dtype=np.float32).reshape(-1, 2))
+                    else:
+                        segments.append(np.zeros((0, 2), dtype=np.float32))
+                lb = np.array(lb_kpt, dtype=np.float32)
+            if nl := len(lb):
+                assert lb.shape[1] == (5 + kpt_len), (
+                    f"segment_pose labels require {5 + kpt_len} columns (class + bbox + keypoints), "
+                    f"got {lb.shape[1]} columns"
+                )
+                # Validate keypoint coordinates
+                points = lb[:, 5:].reshape(-1, ndim)[:, :2]
+                assert points.max() <= 1.01, f"non-normalized or out of bounds coordinates {points[points > 1.01]}"
+                assert lb.min() >= -0.01, f"negative class labels or coordinate {lb[lb < -0.01]}"
+
+                max_cls = 0 if single_cls else lb[:, 0].max()
+                assert max_cls < num_cls, (
+                    f"Label class {int(max_cls)} exceeds dataset class count {num_cls}. "
+                    f"Possible class labels are 0-{num_cls - 1}"
+                )
+                _, i = np.unique(lb, axis=0, return_index=True)
+                if len(i) < nl:
+                    lb = lb[i]
+                    segments = [segments[x] for x in i]
+                    msg = f"{prefix}{im_file}: {nl - len(i)} duplicate labels removed"
+            else:
+                ne = 1
+                lb = np.zeros((0, 5 + kpt_len), dtype=np.float32)
+        else:
+            nm = 1
+            lb = np.zeros((0, 5 + kpt_len), dtype=np.float32)
+
+        # Extract keypoints
+        if lb.shape[0] > 0:
+            keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
+            if ndim == 2:
+                kpt_mask = np.where((keypoints[..., 0] < 0) | (keypoints[..., 1] < 0), 0.0, 1.0).astype(np.float32)
+                keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)
+        else:
+            keypoints = np.zeros((0, nkpt, ndim if ndim == 3 else 3), dtype=np.float32)
+        lb = lb[:, :5]
+        return im_file, lb, shape, segments, keypoints, nm, nf, ne, nc, msg
+    except Exception as e:
+        nc = 1
+        msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
+        return [None, None, None, None, None, nm, nf, ne, nc, msg]
+
+
 def visualize_image_annotations(image_path: str, txt_path: str, label_map: dict[int, str]):
     """Visualize YOLO annotations (bounding boxes and class labels) on an image.
 

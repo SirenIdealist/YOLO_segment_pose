@@ -953,6 +953,141 @@ class PoseLoss26(v8PoseLoss):
         return kpts_loss, kpts_obj_loss, rle_loss
 
 
+class v8SegmentPoseLoss(v8DetectionLoss):
+    """Criterion class for computing training losses for joint segmentation and pose estimation.
+
+    Combines detection, segmentation, and pose losses into a unified 6-component loss:
+    box, seg, cls, dfl, pose, kobj.
+    """
+
+    def __init__(self, model, tal_topk: int = 10, tal_topk2: int = 10):  # model must be de-paralleled
+        """Initialize v8SegmentPoseLoss with segmentation and pose loss components."""
+        super().__init__(model, tal_topk, tal_topk2)
+        self.overlap = model.args.overlap_mask
+
+        # Segmentation components
+        self.nm = model.model[-1].nm
+
+        # Pose components
+        self.kpt_shape = model.model[-1].kpt_shape
+        self.bce_pose = nn.BCEWithLogitsLoss()
+        is_pose = self.kpt_shape == [17, 3]
+        nkpt = self.kpt_shape[0]
+        sigmas = torch.from_numpy(OKS_SIGMA).to(self.device) if is_pose else torch.ones(nkpt, device=self.device) / nkpt
+        self.keypoint_loss = KeypointLoss(sigmas=sigmas)
+
+    def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate the combined detection + segmentation + pose loss."""
+        pred_masks = preds["mask_coefficient"].permute(0, 2, 1).contiguous()
+        proto = preds["proto"]
+        pred_kpts = preds["kpts"].permute(0, 2, 1).contiguous()
+        loss = torch.zeros(6, device=self.device)  # box, seg, cls, dfl, pose, kobj
+
+        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), det_loss, _ = (
+            self.get_assigned_targets_and_loss(preds, batch)
+        )
+        # Re-assign detection loss components
+        loss[0], loss[2], loss[3] = det_loss[0], det_loss[1], det_loss[2]
+
+        batch_size, _, mask_h, mask_w = proto.shape
+        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=pred_masks.dtype) * self.stride[0]
+
+        if fg_mask.sum():
+            # === Segmentation loss ===
+            masks = batch["masks"].to(self.device).float()
+            if tuple(masks.shape[-2:]) != (mask_h, mask_w):
+                proto = F.interpolate(proto, masks.shape[-2:], mode="bilinear", align_corners=False)
+
+            loss[1] = self.calculate_segmentation_loss(
+                fg_mask, masks, target_gt_idx, target_bboxes,
+                batch["batch_idx"].view(-1, 1), proto, pred_masks, imgsz,
+            )
+
+            # === Pose loss ===
+            keypoints = batch["keypoints"].to(self.device).float().clone()
+            keypoints[..., 0] *= imgsz[1]
+            keypoints[..., 1] *= imgsz[0]
+
+            pred_kpts_decoded = v8PoseLoss.kpts_decode(
+                anchor_points, pred_kpts.view(batch_size, -1, *self.kpt_shape)
+            )
+            loss[4], loss[5] = self.calculate_keypoints_loss(
+                fg_mask, target_gt_idx, keypoints,
+                batch["batch_idx"].view(-1, 1), stride_tensor,
+                target_bboxes, pred_kpts_decoded,
+            )
+        # Prevent Multi-GPU DDP 'unused gradient' errors
+        else:
+            loss[1] += (proto * 0).sum() + (pred_masks * 0).sum()
+            loss[4] += (pred_kpts * 0).sum()
+
+        loss[1] *= self.hyp.box  # seg gain
+        loss[4] *= self.hyp.pose  # pose gain
+        loss[5] *= self.hyp.kobj  # kobj gain
+
+        return loss * batch_size, loss.detach()
+
+    @staticmethod
+    def single_mask_loss(
+        gt_mask: torch.Tensor, pred: torch.Tensor, proto: torch.Tensor, xyxy: torch.Tensor, area: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute the instance segmentation loss for a single image."""
+        pred_mask = torch.einsum("in,nhw->ihw", pred, proto)
+        loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
+        return (crop_mask(loss, xyxy).mean(dim=(1, 2)) / area).sum()
+
+    def calculate_segmentation_loss(
+        self, fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz,
+    ) -> torch.Tensor:
+        """Calculate the loss for instance segmentation."""
+        _, _, mask_h, mask_w = proto.shape
+        loss = 0
+        target_bboxes_normalized = target_bboxes / imgsz[[1, 0, 1, 0]]
+        marea = xyxy2xywh(target_bboxes_normalized)[..., 2:].prod(2)
+        mxyxy = target_bboxes_normalized * torch.tensor([mask_w, mask_h, mask_w, mask_h], device=proto.device)
+
+        for i, single_i in enumerate(zip(fg_mask, target_gt_idx, pred_masks, proto, mxyxy, marea, masks)):
+            fg_mask_i, target_gt_idx_i, pred_masks_i, proto_i, mxyxy_i, marea_i, masks_i = single_i
+            if fg_mask_i.any():
+                mask_idx = target_gt_idx_i[fg_mask_i]
+                if self.overlap:
+                    gt_mask = masks_i == (mask_idx + 1).view(-1, 1, 1)
+                    gt_mask = gt_mask.float()
+                else:
+                    gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
+
+                loss += self.single_mask_loss(
+                    gt_mask, pred_masks_i[fg_mask_i], proto_i, mxyxy_i[fg_mask_i], marea_i[fg_mask_i]
+                )
+            else:
+                loss += (proto * 0).sum() + (pred_masks * 0).sum()
+
+        return loss / fg_mask.sum()
+
+    def calculate_keypoints_loss(
+        self, masks, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate the keypoints loss for the model."""
+        selected_keypoints = v8PoseLoss._select_target_keypoints(self, keypoints, batch_idx, target_gt_idx, masks)
+        selected_keypoints[..., :2] /= stride_tensor.view(1, -1, 1, 1)
+
+        kpts_loss = 0
+        kpts_obj_loss = 0
+
+        if masks.any():
+            target_bboxes /= stride_tensor
+            gt_kpt = selected_keypoints[masks]
+            area = xyxy2xywh(target_bboxes[masks])[:, 2:].prod(1, keepdim=True)
+            pred_kpt = pred_kpts[masks]
+            kpt_mask = gt_kpt[..., 2] != 0 if gt_kpt.shape[-1] == 3 else torch.full_like(gt_kpt[..., 0], True)
+            kpts_loss = self.keypoint_loss(pred_kpt, gt_kpt, kpt_mask, area)
+
+            if pred_kpt.shape[-1] == 3:
+                kpts_obj_loss = self.bce_pose(pred_kpt[..., 2], kpt_mask.float())
+
+        return kpts_loss, kpts_obj_loss
+
+
 class v8ClassificationLoss:
     """Criterion class for computing training losses for classification."""
 

@@ -1451,6 +1451,130 @@ class PoseMetrics(DetMetrics):
         return summary
 
 
+class SegmentPoseMetrics(DetMetrics):
+    """Calculate and aggregate detection, segmentation, and pose metrics over a given set of classes.
+
+    This class combines box detection, mask segmentation, and keypoint pose metrics into a unified
+    evaluation framework for multi-task models.
+
+    Attributes:
+        seg (Metric): An instance of the Metric class for mask segmentation metrics.
+        pose (Metric): An instance of the Metric class for keypoint pose metrics.
+    """
+
+    def __init__(self, names: dict[int, str] = {}) -> None:
+        """Initialize SegmentPoseMetrics with class names."""
+        DetMetrics.__init__(self, names)
+        self.seg = Metric()
+        self.pose = Metric()
+        self.stats["tp_m"] = []  # mask true positives
+        self.stats["tp_p"] = []  # pose true positives
+
+    def process(self, save_dir: Path = Path("."), plot: bool = False, on_plot=None) -> dict[str, np.ndarray]:
+        """Process detection, segmentation, and pose metrics."""
+        stats = DetMetrics.process(self, save_dir, plot, on_plot=on_plot)  # process box stats
+
+        # Process mask metrics
+        results_mask = ap_per_class(
+            stats["tp_m"],
+            stats["conf"],
+            stats["pred_cls"],
+            stats["target_cls"],
+            plot=plot,
+            on_plot=on_plot,
+            save_dir=save_dir,
+            names=self.names,
+            prefix="Mask",
+        )[2:]
+        self.seg.nc = len(self.names)
+        self.seg.update(results_mask)
+
+        # Process pose metrics
+        results_pose = ap_per_class(
+            stats["tp_p"],
+            stats["conf"],
+            stats["pred_cls"],
+            stats["target_cls"],
+            plot=plot,
+            on_plot=on_plot,
+            save_dir=save_dir,
+            names=self.names,
+            prefix="Pose",
+        )[2:]
+        self.pose.nc = len(self.names)
+        self.pose.update(results_pose)
+
+        return stats
+
+    @property
+    def keys(self) -> list[str]:
+        """Return a list of keys for accessing metrics."""
+        return [
+            *DetMetrics.keys.fget(self),
+            "metrics/precision(M)",
+            "metrics/recall(M)",
+            "metrics/mAP50(M)",
+            "metrics/mAP50-95(M)",
+            "metrics/precision(P)",
+            "metrics/recall(P)",
+            "metrics/mAP50(P)",
+            "metrics/mAP50-95(P)",
+        ]
+
+    def mean_results(self) -> list[float]:
+        """Return the mean metrics for box, segmentation, and pose results."""
+        return DetMetrics.mean_results(self) + self.seg.mean_results() + self.pose.mean_results()
+
+    def class_result(self, i: int) -> list[float]:
+        """Return classification results for a specified class index."""
+        return DetMetrics.class_result(self, i) + self.seg.class_result(i) + self.pose.class_result(i)
+
+    @property
+    def maps(self) -> np.ndarray:
+        """Return mAP scores for box, segmentation, and pose."""
+        return DetMetrics.maps.fget(self) + self.seg.maps + self.pose.maps
+
+    @property
+    def fitness(self) -> float:
+        """Return the combined fitness score for all three tasks."""
+        return DetMetrics.fitness.fget(self) + self.seg.fitness() + self.pose.fitness()
+
+    @property
+    def curves(self) -> list[str]:
+        """Return a list of curves for accessing specific metrics curves."""
+        return [
+            *DetMetrics.curves.fget(self),
+            "Precision-Recall(M)",
+            "F1-Confidence(M)",
+            "Precision-Confidence(M)",
+            "Recall-Confidence(M)",
+            "Precision-Recall(P)",
+            "F1-Confidence(P)",
+            "Precision-Confidence(P)",
+            "Recall-Confidence(P)",
+        ]
+
+    @property
+    def curves_results(self) -> list[list]:
+        """Return a list of computed performance metrics and statistics."""
+        return DetMetrics.curves_results.fget(self) + self.seg.curves_results + self.pose.curves_results
+
+    def summary(self, normalize: bool = True, decimals: int = 5) -> list[dict[str, Any]]:
+        """Generate per-class summary with box, mask, and pose metrics."""
+        per_class = {
+            "Mask-P": self.seg.p,
+            "Mask-R": self.seg.r,
+            "Mask-F1": self.seg.f1,
+            "Pose-P": self.pose.p,
+            "Pose-R": self.pose.r,
+            "Pose-F1": self.pose.f1,
+        }
+        summary = DetMetrics.summary(self, normalize, decimals)
+        for i, s in enumerate(summary):
+            s.update({**{k: round(v[i], decimals) for k, v in per_class.items()}})
+        return summary
+
+
 class ClassifyMetrics(SimpleClass, DataExportMixin):
     """Class for computing classification metrics including top-1 and top-5 accuracy.
 

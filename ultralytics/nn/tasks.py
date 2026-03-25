@@ -58,6 +58,7 @@ from ultralytics.nn.modules import (
     Pose,
     Pose26,
     RepC3,
+    SegmentPose,
     RepConv,
     RepNCSPELAN4,
     RepVGGDW,
@@ -82,6 +83,7 @@ from ultralytics.utils.loss import (
     v8DetectionLoss,
     v8OBBLoss,
     v8PoseLoss,
+    v8SegmentPoseLoss,
     v8SegmentationLoss,
 )
 from ultralytics.utils.ops import make_divisible
@@ -617,6 +619,39 @@ class PoseModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
         return E2ELoss(self, PoseLoss26) if getattr(self, "end2end", False) else v8PoseLoss(self)
+
+
+class SegmentPoseModel(DetectionModel):
+    """YOLO segment-pose model for simultaneous segmentation and pose estimation.
+
+    This class extends DetectionModel to handle joint instance segmentation and keypoint estimation tasks.
+
+    Attributes:
+        kpt_shape (tuple): Shape of keypoints data (num_keypoints, num_dimensions).
+    """
+
+    def __init__(self, cfg="yolov8n-segpose.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+        """Initialize SegmentPoseModel with config, channels, classes, and keypoint shape."""
+        if not isinstance(cfg, dict):
+            cfg = yaml_model_load(cfg)
+        if any(data_kpt_shape) and list(data_kpt_shape) != list(cfg["kpt_shape"]):
+            LOGGER.info(f"Overriding model.yaml kpt_shape={cfg['kpt_shape']} with kpt_shape={data_kpt_shape}")
+            cfg["kpt_shape"] = data_kpt_shape
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the SegmentPoseModel."""
+        from ultralytics.utils.loss import v8SegmentPoseLoss
+
+        return v8SegmentPoseLoss(self)
+
+    def _predict_augment(self, x):
+        """Augmented inference is not yet supported for segment_pose models."""
+        LOGGER.warning(
+            f"WARNING: {self.__class__.__name__} does not support augmented inference. "
+            "Using single-scale inference instead."
+        )
+        return self._predict_once(x)
 
 
 class ClassificationModel(BaseModel):
@@ -1691,12 +1726,13 @@ def parse_model(d, ch, verbose=True):
                 Pose26,
                 OBB,
                 OBB26,
+                SegmentPose,
             }
         ):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
-            if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
+            if m in {Segment, YOLOESegment, Segment26, YOLOESegment26, SegmentPose}:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26, SegmentPose}:
                 m.legacy = legacy
         elif m is v10Detect:
             args.append([ch[x] for x in f])
@@ -1786,6 +1822,8 @@ def guess_model_task(model):
             return "classify"
         if "detect" in m:
             return "detect"
+        if "segmentpose" in m:
+            return "segment_pose"
         if "segment" in m:
             return "segment"
         if "pose" in m:
@@ -1806,7 +1844,9 @@ def guess_model_task(model):
             with contextlib.suppress(Exception):
                 return cfg2task(eval(x))  # nosec B307: safe eval of known attribute paths
         for m in model.modules():
-            if isinstance(m, (Segment, YOLOESegment)):
+            if isinstance(m, SegmentPose):
+                return "segment_pose"
+            elif isinstance(m, (Segment, YOLOESegment)):
                 return "segment"
             elif isinstance(m, Classify):
                 return "classify"
@@ -1820,7 +1860,9 @@ def guess_model_task(model):
     # Guess from model filename
     if isinstance(model, (str, Path)):
         model = Path(model)
-        if "-seg" in model.stem or "segment" in model.parts:
+        if "-segpose" in model.stem or "segmentpose" in model.parts:
+            return "segment_pose"
+        elif "-seg" in model.stem or "segment" in model.parts:
             return "segment"
         elif "-cls" in model.stem or "classify" in model.parts:
             return "classify"

@@ -20,7 +20,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "SegmentPose", "YOLOEDetect", "YOLOESegment", "v10Detect"
 
 
 class Detect(nn.Module):
@@ -650,6 +650,136 @@ class Pose(Detect):
             y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
+
+
+class SegmentPose(Detect):
+    """YOLO SegmentPose head for joint segmentation and pose estimation models.
+
+    This class extends the Detect head to include both mask prediction (cv4) and keypoint prediction (cv5)
+    capabilities for simultaneous instance segmentation and pose estimation tasks.
+
+    Attributes:
+        nm (int): Number of masks.
+        npr (int): Number of protos.
+        proto (Proto): Prototype generation module.
+        cv4 (nn.ModuleList): Convolution layers for mask coefficients.
+        kpt_shape (tuple): Number of keypoints and dimensions (2 for x,y or 3 for x,y,visible).
+        nk (int): Total number of keypoint values.
+        cv5 (nn.ModuleList): Convolution layers for keypoint prediction.
+    """
+
+    def __init__(self, nc: int = 80, kpt_shape: tuple = (17, 3), nm: int = 32, npr: int = 256, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize SegmentPose head with mask and keypoint prediction branches.
+
+        Args:
+            nc (int): Number of classes.
+            kpt_shape (tuple): Number of keypoints, number of dims (2 for x,y or 3 for x,y,visible).
+            nm (int): Number of masks.
+            npr (int): Number of protos.
+            reg_max (int): Maximum number of DFL channels.
+            end2end (bool): Whether to use end-to-end NMS-free detection.
+            ch (tuple): Tuple of channel sizes from backbone feature maps.
+        """
+        super().__init__(nc, reg_max, end2end, ch)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.proto = Proto(ch[0], self.npr, self.nm)  # protos
+
+        # Mask coefficient branch (cv4)
+        c4 = max(ch[0] // 4, self.nm)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
+
+        # Keypoint branch (cv5)
+        self.kpt_shape = kpt_shape
+        self.nk = kpt_shape[0] * kpt_shape[1]
+        c5 = max(ch[0] // 4, self.nk)
+        self.cv5 = nn.ModuleList(nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.nk, 1)) for x in ch)
+
+        if end2end:
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
+            self.one2one_cv5 = copy.deepcopy(self.cv5)
+
+    @property
+    def one2many(self):
+        """Returns the one-to-many head components."""
+        return dict(box_head=self.cv2, cls_head=self.cv3, mask_head=self.cv4, pose_head=self.cv5)
+
+    @property
+    def one2one(self):
+        """Returns the one-to-one head components."""
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, mask_head=self.one2one_cv4, pose_head=self.one2one_cv5)
+
+    def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
+        """Return model outputs including mask coefficients, protos, and keypoints."""
+        outputs = super().forward(x)
+        preds = outputs[1] if isinstance(outputs, tuple) else outputs
+        proto = self.proto(x[0])  # mask protos
+        if isinstance(preds, dict):  # training and validating during training
+            if self.end2end:
+                preds["one2many"]["proto"] = proto
+                preds["one2one"]["proto"] = proto.detach()
+            else:
+                preds["proto"] = proto
+        if self.training:
+            return preds
+        return (outputs, proto) if self.export else ((outputs[0], proto), preds)
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode predicted bboxes, class probs, mask coefficients, and keypoints."""
+        preds = Detect._inference(self, x)
+        kpts = self.kpts_decode(x["kpts"])
+        return torch.cat([preds, x["mask_coefficient"], kpts], dim=1)
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module,
+        cls_head: torch.nn.Module,
+        mask_head: torch.nn.Module,
+        pose_head: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        """Concatenates and returns predicted bboxes, class probs, mask coefficients, and keypoints."""
+        preds = Detect.forward_head(self, x, box_head, cls_head)
+        bs = x[0].shape[0]
+        if mask_head is not None:
+            preds["mask_coefficient"] = torch.cat([mask_head[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)
+        if pose_head is not None:
+            preds["kpts"] = torch.cat([pose_head[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], 2)
+        return preds
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Post-process YOLO model predictions for SegmentPose."""
+        boxes, scores, mask_coefficient, kpts = preds.split([4, self.nc, self.nm, self.nk], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        mask_coefficient = mask_coefficient.gather(dim=1, index=idx.repeat(1, 1, self.nm))
+        kpts = kpts.gather(dim=1, index=idx.repeat(1, 1, self.nk))
+        return torch.cat([boxes, scores, conf, mask_coefficient, kpts], dim=-1)
+
+    def kpts_decode(self, kpts: torch.Tensor) -> torch.Tensor:
+        """Decode keypoints from predictions."""
+        ndim = self.kpt_shape[1]
+        bs = kpts.shape[0]
+        if self.export:
+            y = kpts.view(bs, *self.kpt_shape, -1)
+            a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
+            if ndim == 3:
+                a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
+            return a.view(bs, self.nk, -1)
+        else:
+            y = kpts.clone()
+            if ndim == 3:
+                if NOT_MACOS14:
+                    y[:, 2::ndim].sigmoid_()
+                else:
+                    y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
+            y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
+            y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
+            return y
+
+    def fuse(self) -> None:
+        """Remove the one2many head for inference optimization."""
+        self.cv2 = self.cv3 = self.cv4 = self.cv5 = None
 
 
 class Pose26(Pose):
